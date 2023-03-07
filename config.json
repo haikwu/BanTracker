@@ -1,5 +1,4 @@
 {
-    "API-Keys": [],
-    "Token": "",
-    "Channel": 1234567890
+    "channels": [1234567890, 0987654321], 
+    "token": "TOKEN"
 }
