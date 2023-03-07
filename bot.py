@@ -1,83 +1,111 @@
 import math
-import time
 import json
-import requests as reqs
-from colorama import Fore
-
+import time
 import discord
+import logging
+import requests as reqs
 from discord.ext import tasks
-from discord.ext import commands
-
-bot = commands.Bot(command_prefix="nya~", intents=discord.Intents.default())
-
-with open("config.json") as conf:
-    config = json.load(conf)
-    channel_id = config["Channel"]
-    api_keys = config["API-Keys"]
-    bot_token = config["Token"]
-
-# API Key checks
-for key in api_keys:
-    key_check = reqs.get(
-        "https://api.hypixel.net/punishmentstats", headers={"API-Key": key}
-    ).json()
-    if "cause" in key_check:
-        print(f"{Fore.YELLOW}{key} is an invalid API Key! It is no longer being used.{Fore.RESET}")
-        api_keys.remove(key)
-
-if not api_keys:
-    print(f"{Fore.RED}No usable API Keys were found. The bot will not attempt to run without API Keys.{Fore.RESET}")
-    exit()
-
-global owd_bans, ostaff_bans, update_delay
-owd_bans = None
-ostaff_bans = None
-update_delay = (1 / len(api_keys)) * 0.5
 
 
-#Startup
-@bot.event
-async def on_ready():
-    global channel
-    channel = bot.get_channel(channel_id)
-    print(f"Logging channel set to {channel.name}")
-    checkloop.start()
-    print(f"{Fore.LIGHTGREEN_EX}Checker has started!{Fore.RESET}")
+class JSONConfig:
+    def __init__(self, file_name: str) -> None:
+        self.file_name = file_name
+        with open(file_name) as conf:
+            self.config = json.load(conf)
+
+    def update(self, key: str, value: any):
+        self.config[key] = value
+        with open(self.file_name, "w") as conf:
+            json.dump(self.config, conf, indent=4)
 
 
-# The actual checker
-@tasks.loop(seconds=0.1)
-async def checkloop():
-    global update_delay
-    for key in api_keys:
-        global owd_bans, ostaff_bans
-        curr_stats = reqs.get(
-            "https://api.hypixel.net/punishmentstats", headers={"API-Key": key}
-        ).json()
-        wd_bans = curr_stats["watchdog_total"]
-        staff_bans = curr_stats["staff_total"]
-        if owd_bans != None and ostaff_bans != None:
-            wban_dif = wd_bans - owd_bans
-            sban_dif = staff_bans - ostaff_bans
+class BanTracker:
+    def __init__(self) -> None:
+        self.owd_bans = None
+        self.ostaff_bans = None
+        self.session = reqs.Session()
+        self.session.headers.update({"User-Agent": "i am a professional boy kisser"}) #The user agent can be anything, plancke only blocks the default requests user agent
+
+    def check_bans(self):
+        curr_stats = self.session.get(
+            'https://api.plancke.io/hypixel/v1/punishmentStats'
+        ).json().get('record')
+        wd_bans = curr_stats.get("watchdog_total")
+        staff_bans = curr_stats.get("staff_total")
+        embeds = []
+
+        if self.owd_bans != None and self.ostaff_bans != None:
+            wban_dif = wd_bans - self.owd_bans
+            sban_dif = staff_bans - self.ostaff_bans
 
             if wban_dif > 0:
                 embed = discord.Embed(
                     color=discord.Color.from_rgb(247, 57, 24),
                     description=f"<t:{math.floor(time.time())}:R>",
-                ).set_author(name=f"Watchdog banned {wban_dif} player(s)!")
-                await channel.send(embed=embed)
+                ).set_author(name=f"Watchdog banned {wban_dif} player{'s'[:wban_dif^1]}!")
+                embeds.append(embed)
 
             if sban_dif > 0:
                 embed = discord.Embed(
                     color=discord.Color.from_rgb(247, 229, 24),
                     description=f"<t:{math.floor(time.time())}:R>",
-                ).set_author(name=f"Staff banned {sban_dif} player(s)!")
-                await channel.send(embed=embed)
+                ).set_author(name=f"Staff banned {sban_dif} player{'s'[:sban_dif^1]}!")
+                embeds.append(embed)
 
-        owd_bans = wd_bans
-        ostaff_bans = staff_bans
+        self.owd_bans = wd_bans
+        self.ostaff_bans = staff_bans
+        return embeds
 
-        time.sleep(update_delay)
+
+class BanTrackerBot(discord.Client):
+    def __init__(self, intents: discord.Intents) -> None:
+        super().__init__(intents=intents)
+        self.tree = discord.app_commands.CommandTree(self)
+        self.jsonconfig = JSONConfig("config.json")
+        self.bantracker = BanTracker()
+        self.logger = logging.getLogger('discord')
+
+        @self.event
+        async def on_ready():
+            self.channel_ids = self.jsonconfig.config.get("channels")
+            for guild in self.guilds:
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
+            self.logger.info(f"Synced commands with {len(self.guilds)} guild{'s'[:len(self.guilds)^1]}.")
+            check_loop.start()
+
+        @self.event
+        async def on_guild_join(guild):
+            self.tree.copy_global_to(guild=guild)
+            await self.tree.sync(guild=guild)
+            self.logger.info(f"Synced commands with {guild.name}.")
+
+        @self.tree.command()
+        async def subscribe(interaction: discord.Interaction):
+            """Subscribes the channel which the command is ran in to the Ban Tracker"""
+            if interaction.channel_id not in self.channel_ids:
+                self.channel_ids.append(interaction.channel_id)
+                self.jsonconfig.update("channels", self.channel_ids)
+                self.logger.info(f"{interaction.channel.name} in {interaction.guild.name} was subscribed.")
+                await interaction.response.send_message("> This channel is now subscribed.")
+            else:
+                await interaction.response.send_message("> This channel is already subscribed.")
+
+        @self.tree.command()
+        async def unsubscribe(interaction: discord.Interaction):
+            """Unsubscribes the channel which the command is ran in to the Ban Tracker"""
+            self.channel_ids.remove(interaction.channel_id)
+            self.jsonconfig.update("channels", self.channel_ids)
+            self.logger.info(f"{interaction.channel.name} in {interaction.guild.name} was unsubscribed.")
+            await interaction.response.send_message("> This channel is no longer subscribed.")
+
+        @tasks.loop(seconds=0.1)
+        async def check_loop():
+            bans = self.bantracker.check_bans()
+            if bans:
+                [await self.get_channel(channel_id).send(embed=embed) for embed in bans for channel_id in self.channel_ids]
 
 
-bot.run(bot_token)
+if __name__ == "__main__":
+    discordbot = BanTrackerBot(discord.Intents.default())
+    discordbot.run(discordbot.jsonconfig.config.get("token"))
